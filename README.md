@@ -262,7 +262,10 @@ curl -s -X POST http://localhost:8000/api/v1/audits/diff \
   `result.dangerous_spans[]` 的对应元素，`logical_index` 与其保持一致。
 - `result` 是对**重建后新增文本**（无新增行之间的空行拼接问题：按新文件顺序逐行
   连接，行末按 No-newline 标记决定是否补 `\n`）的原始解析结果，结构与
-  `POST /api/v1/audits` 完全一致，因此该记录同样支持 `verify` 与 `sarif`。
+  `POST /api/v1/audits` 完全一致，因此该记录同样支持 `verify` 与 `sarif`；
+  `sarif` 导出会依据 `meta.added_lines` 把定位回映射到**新文件真实行号**
+  （跨 hunk 的危险区段按连续新增行段拆成多个 location，不覆盖未审计行），
+  详见下文 SARIF 一节。
 - 纯删除文件、二进制补丁（`Binary files … differ` / `GIT binary patch` Base85 段）、
   空文件与无新增行的文件不产生记录（仍计入合法 diff）；所有文件都无新增内容时
   返回 201、`file_count: 0`、`risk_level: "info"`。
@@ -920,6 +923,7 @@ curl -s http://localhost:8000/api/v1/audits/1/verify | jq
 - 为每个**危险区段**（RLO/LRO 覆盖范围、未闭合区段）生成一条 result，定位到整个 `[start, end)` 区段；
 - 每条 result 的 `level` 由其 `risk` 映射：`critical/high → error`、`medium → warning`、`low/info → note`（规则 `defaultConfiguration.level` 与 `properties.security-severity` 同步设置）；
 - `region` 的行列均为 1 起始，**列按 UTF-16 码元逐行计算**（SARIF 规范要求），使用存储的原文重算，含 astral 字符（如 emoji，占 2 个 UTF-16 码元）时列号正确偏移；跨多行的区段同时给出 `startLine/endLine`；
+- **unified diff 审计记录**（`POST /api/v1/audits/diff` 落库、`meta.source == "unified_diff"`）的 `raw_text` 只是重建后的新增行，导出时依据记录的 `meta.added_lines` 与 `raw_text` 把控制符错误和危险区段回映射到**新文件真实行号**（列仍按 UTF-16 码元计算）；危险区段跨越不连续的新增行（hunk 间隙）时，按新文件行号连续的新增行段拆分为同一 result 的多个 location，**只为实际审计的新增行生成定位**，中间未审计行不包含进任何 region；`meta` 缺失或与 `raw_text` 不一致时回退为按重建文本整体定位，导出不会失败；
 - location 的 `artifactLocation.uri` 取记录中的 `filename`；缺失文件名时回退为 `audit-{id}`；
 - 每条 result 带稳定 `partialFingerprints`：对「规则 id | 码点 | 起止码点范围」取 SHA-256，**不含数据库行 id**，因此同一内容重复审计产生相同指纹，便于平台做去重/回归匹配；
 - `rules` 去重并按 id 排序，`results` 按（起始行、起始列、规则 id）排序，输出完全确定。
@@ -1246,7 +1250,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
-│   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
+│   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、diff 记录回映射新文件行号、指纹）
 │   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json）
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── main.py        # FastAPI 路由
@@ -1264,7 +1268,8 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_compare.py # 回归比较接口测试（新增/消失/位移/配对范围/404/422）
 │   ├── test_gate.py   # 路径风险门禁测试（模板匹配/优先级/默认阈值/只读/404/422）
 │   ├── test_verify.py  # 重算校验接口测试（一致/篡改/缺失 vs null/只读/404）
-│   └── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
+│   ├── test_sarif.py  # SARIF 导出测试（level 映射/UTF-16 列/指纹/排序/404）
+│   └── test_sarif_diff.py # diff 记录的 SARIF 导出（新文件真实行号/跨 hunk 区段拆分/UTF-16 列/指纹/meta 回退）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -1291,6 +1296,11 @@ SARIF 信封与工具元数据、清洁/仅标记零发现、文件名与 `audit
 risk→level 映射（error/warning）、未闭合/平衡/孤立/隐式终止各类 rule/result、
 astral 字符与跨行区段的 UTF-16 列、规则去重排序、结果确定性排序、
 partialFingerprints 的稳定性与随范围/规则变化、重复审计同指纹、以及 404；
+diff 审计记录的 SARIF 导出覆盖新增行回映射到新文件真实行号（多 hunk 错位修复）、
+跨 hunk 间隙的危险区段按连续新增行段拆分多个 location（不覆盖未审计行）、
+连续新增行保持单 location、No-newline 行末、astral 字符 UTF-16 列、
+重复审计与同内容纯文本记录的指纹一致，以及 meta 与 `raw_text` 不一致时的
+整体回退；
 unified diff 审计覆盖多文件/多 hunk 解析、仅分析新增行（删除行与上下文行被忽略）、
 按新文件行号推进与列映射、diff 行/列映射与逻辑索引保留、未闭合/孤立/隐式终止错误
 与跨行危险区段回映射、每文件一条记录与汇总最高风险、No-newline 标记（行末/行中）、

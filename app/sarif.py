@@ -12,6 +12,12 @@ scanning, Azure DevOps SARIF importer, ...):
   (critical/high -> error, medium -> warning, low/info -> note);
 * regions use 1-based **UTF-16 code-unit** columns, recomputed from the stored
   original text line by line (as required by the SARIF specification);
+* records produced by ``POST /api/v1/audits/diff`` (``meta.source ==
+  "unified_diff"``) store only the rebuilt added lines as ``raw_text``, so
+  their findings are mapped back to the **real new-file line numbers** carried
+  by ``meta.added_lines``; a dangerous span crossing discontinuous added lines
+  (a hunk gap) yields one location per contiguous run of audited lines, so
+  unaudited lines in between are never covered by a region;
 * ``partialFingerprints`` is a stable SHA-256 over rule id, codepoint and
   codepoint range -- it does not depend on the database row id, so re-auditing
   the same content maps to the same fingerprint;
@@ -23,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import re
 from bisect import bisect_right
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import quote
 
 from .bidi import escape_preview
@@ -74,8 +80,16 @@ _TROJAN_NOTE = (
 
 
 # ---------------------------------------------------------------------------
-# Text indexing: logical (code-point) offset -> line + UTF-16 column
+# Locators: logical (code-point) offsets -> SARIF regions
 # ---------------------------------------------------------------------------
+
+class _Segment(NamedTuple):
+    """One SARIF region plus the audited-text range it covers."""
+
+    region: dict[str, int]
+    start: int   # code-point offset of the segment in the audited text
+    end: int     # exclusive end offset
+
 
 class _TextIndex:
     """Map Python str indices (code points) to 1-based line/UTF-16 columns."""
@@ -122,6 +136,117 @@ class _TextIndex:
 def _utf16_width(ch: str) -> int:
     """UTF-16 code units occupied by one code point (1 BMP, 2 astral)."""
     return 2 if ord(ch) > 0xFFFF else 1
+
+
+class _PlainLocator:
+    """Locator for ordinary records: offsets map straight into the text."""
+
+    def __init__(self, text: str) -> None:
+        self._index = _TextIndex(text)
+
+    def regions(self, start: int, end: int) -> list[_Segment]:
+        return [_Segment(self._index.region(start, end), start, end)]
+
+
+class _DiffLocator:
+    """Locator for unified-diff records (``meta.source == "unified_diff"``).
+
+    The stored ``raw_text`` is the concatenation of the audited added lines
+    only, so counting its lines directly maps findings to *rebuilt* line
+    numbers: a control on new-file line 80 of a multi-hunk diff would surface
+    on SARIF line 2.  ``meta.added_lines`` carries each added line's real
+    new-file line number; every rebuilt line belongs to the added entry that
+    starts it (entries whose predecessor carries ``no_newline`` are glued
+    onto the same rebuilt line).  A finding spanning several added lines
+    yields one region per maximal run of added lines whose new-file line
+    numbers are consecutive, so unaudited lines between hunks are never
+    included in a region.
+    """
+
+    def __init__(self, text: str, added_lines: list[dict]) -> None:
+        self._text = text
+        # UTF-16 length of the text up to (but excluding) code point i.
+        self._utf16_prefix = [0]
+        for ch in text:
+            self._utf16_prefix.append(self._utf16_prefix[-1] + _utf16_width(ch))
+        # Rebuilt lines: (start offset, line text, terminated by "\n").
+        self._lines: list[tuple[int, str, bool]] = []
+        pos = 0
+        while True:
+            newline = text.find("\n", pos)
+            if newline == -1:
+                if pos < len(text) or not self._lines:
+                    self._lines.append((pos, text[pos:], False))
+                break
+            self._lines.append((pos, text[pos:newline], True))
+            pos = newline + 1
+        # New-file line number of every rebuilt line: added entry k starts a
+        # rebuilt line iff it is the first entry or entry k-1 was terminated
+        # by a newline separator.
+        self._new_lines: list[int] = []
+        for k, entry in enumerate(added_lines):
+            if not isinstance(entry, dict):
+                raise ValueError("added_lines entries must be objects")
+            new_line = entry.get("new_line")
+            if not isinstance(new_line, int) or new_line < 1:
+                raise ValueError("added_lines entries need new_line >= 1")
+            if k == 0 or not added_lines[k - 1].get("no_newline", False):
+                self._new_lines.append(new_line)
+        if len(self._new_lines) != len(self._lines):
+            raise ValueError("added_lines meta does not match raw_text")
+
+    def regions(self, start: int, end: int) -> list[_Segment]:
+        # Maximal runs of intersected rebuilt lines whose new-file line
+        # numbers are consecutive: [first line idx, last line idx, segment
+        # start offset, segment end offset].
+        runs: list[list[int]] = []
+        for idx, (line_start, line_text, has_newline) in enumerate(self._lines):
+            cover_end = line_start + len(line_text) + (1 if has_newline else 0)
+            seg_start = max(start, line_start)
+            seg_end = min(end, cover_end)
+            if seg_start >= seg_end:
+                continue
+            if runs and self._new_lines[idx] == self._new_lines[runs[-1][1]] + 1:
+                runs[-1][1] = idx
+                runs[-1][3] = seg_end
+            else:
+                runs.append([idx, idx, seg_start, seg_end])
+        if not runs:
+            # Defensive: a valid finding always intersects a rebuilt line.
+            return _PlainLocator(self._text).regions(start, end)
+        segments = []
+        for first, last, seg_start, seg_end in runs:
+            region = {
+                "startLine": self._new_lines[first],
+                "startColumn": (
+                    self._utf16_prefix[seg_start]
+                    - self._utf16_prefix[self._lines[first][0]] + 1
+                ),
+                "endLine": self._new_lines[last],
+                "endColumn": (
+                    self._utf16_prefix[seg_end]
+                    - self._utf16_prefix[self._lines[last][0]] + 1
+                ),
+            }
+            segments.append(_Segment(region, seg_start, seg_end))
+        return segments
+
+
+def _make_locator(record: dict[str, Any], text: str):
+    """Pick the locator matching the record's origin.
+
+    Unified-diff records carry ``meta.added_lines`` and are mapped to real
+    new-file line numbers; anything else (plain text, JSON string values, or
+    inconsistent/absent meta) uses the plain whole-text mapping.
+    """
+    meta = record.get("meta") or {}
+    added_lines = meta.get("added_lines")
+    if meta.get("source") == "unified_diff" and added_lines:
+        try:
+            return _DiffLocator(text, added_lines)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            pass  # inconsistent meta: fall back to the plain mapping
+    return _PlainLocator(text)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +439,7 @@ def build_sarif(record: dict[str, Any]) -> dict[str, Any]:
     audit_id = record["id"]
     text = record["raw_text"]
     result = record["result"]
-    index = _TextIndex(text)
+    locator = _make_locator(record, text)
 
     filename = record.get("filename")
     uri = filename if filename else f"audit-{audit_id}"
@@ -359,18 +484,22 @@ def build_sarif(record: dict[str, Any]) -> dict[str, Any]:
         rules.setdefault(rule_id, rule)
 
         idx = control["logical_index"]
-        region = index.region(idx, idx + 1)
-        region["snippet"] = {"text": escape_preview(text[idx])}
-        findings.append({
-            "ruleId": rule_id,
-            "level": _SARIF_LEVEL[control["risk"]],
-            "message": {"text": error},
-            "locations": [{
+        snippet = escape_preview(text[idx])
+        locations = []
+        for segment in locator.regions(idx, idx + 1):
+            region = segment.region
+            region["snippet"] = {"text": snippet}
+            locations.append({
                 "physicalLocation": {
                     "artifactLocation": {"uri": artifact_uri},
                     "region": region,
                 }
-            }],
+            })
+        findings.append({
+            "ruleId": rule_id,
+            "level": _SARIF_LEVEL[control["risk"]],
+            "message": {"text": error},
+            "locations": locations,
             "partialFingerprints": _fingerprint(rule_id, codepoint, idx, idx + 1),
             "properties": {
                 "codepoint": codepoint,
@@ -391,18 +520,27 @@ def build_sarif(record: dict[str, Any]) -> dict[str, Any]:
 
         raw = text[start:end]
         escaped = span.get("escaped_preview") or escape_preview(raw)
-        region = index.region(start, end)
-        region["snippet"] = {"text": escaped}
-        findings.append({
-            "ruleId": rule_id,
-            "level": _SARIF_LEVEL[span["risk"]],
-            "message": {"text": span["reason"]},
-            "locations": [{
+        segments = locator.regions(start, end)
+        locations = []
+        for segment in segments:
+            region = segment.region
+            # A finding split across discontinuous added lines shows each
+            # segment's own text; a single region keeps the stored preview.
+            snippet = escaped if len(segments) == 1 else escape_preview(
+                text[segment.start:segment.end]
+            )
+            region["snippet"] = {"text": snippet}
+            locations.append({
                 "physicalLocation": {
                     "artifactLocation": {"uri": artifact_uri},
                     "region": region,
                 }
-            }],
+            })
+        findings.append({
+            "ruleId": rule_id,
+            "level": _SARIF_LEVEL[span["risk"]],
+            "message": {"text": span["reason"]},
+            "locations": locations,
             "partialFingerprints": _fingerprint(rule_id, codepoint, start, end),
             "properties": {
                 "opener": opener,
