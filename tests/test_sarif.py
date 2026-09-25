@@ -1,5 +1,6 @@
 """API tests for GET /api/v1/audits/{id}/sarif (SARIF 2.1.0 export)."""
 
+import copy
 import hashlib
 import json
 import re
@@ -9,6 +10,7 @@ RLE = "‫"
 RLO = "‮"
 PDF = "‬"
 LRI = "⁦"
+RLI = "⁦"
 PDI = "⁩"
 LRM = "‎"
 ZWSP = "​"
@@ -335,3 +337,207 @@ def test_sarif_full_document_is_json_stable(client):
     first = _sarif(client, audit_id).content
     second = _sarif(client, audit_id).content
     assert first == second
+
+
+# ----------------------------------------------------- unified-diff records ---
+
+def _post_diff(client, diff):
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 201, resp.text
+    return resp.json()["items"][0]["id"]
+
+
+def _two_hunk_diff(*, first_added, second_added, second_new=80,
+                   second_old=80, path="f.py"):
+    return (
+        f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+        "@@ -1,1 +1,2 @@\n keep1\n"
+        f"+{first_added}\n"
+        f"@@ -{second_old},1 +{second_new},1 @@\n-gone\n"
+        f"+{second_added}\n"
+    )
+
+
+def test_sarif_diff_control_locates_to_real_new_file_line(client):
+    # The added line is new-file line 80, but raw_text is just the two added
+    # lines concatenated: without relocation the RLO lands on SARIF line 2.
+    audit_id = _post_diff(
+        client,
+        _two_hunk_diff(first_added="add1", second_added=f"x{RLO}bad{PDF}"),
+    )
+    body = _sarif(client, audit_id).json()
+
+    results = _results(body)
+    assert len(results) == 1
+    assert _region(results[0]) == {
+        "startLine": 80, "startColumn": 2, "endLine": 80, "endColumn": 6,
+        "snippet": {"text": "⟨RLO⟩bad"},
+    }
+
+
+def test_sarif_diff_columns_are_utf16_on_real_line(client):
+    # Astral emoji takes 2 UTF-16 code units before the RLO.
+    audit_id = _post_diff(
+        client,
+        _two_hunk_diff(first_added="add1", second_added=f"😀x{RLO}y"),
+    )
+    body = _sarif(client, audit_id).json()
+
+    control = _find(body, "bidi/unclosed-RLO")[0]
+    assert _region(control)["startLine"] == 80
+    assert _region(control)["startColumn"] == 4
+    assert _region(control)["endColumn"] == 5
+
+    span = _find(body, "bidi/span-RLO")[0]
+    assert _region(span) == {
+        "startLine": 80, "startColumn": 4, "endLine": 80, "endColumn": 6,
+        "snippet": {"text": "⟨RLO⟩y\\n"},
+    }
+
+
+def test_sarif_diff_orphan_closer_locates_to_real_line(client):
+    audit_id = _post_diff(
+        client,
+        _two_hunk_diff(first_added="add1", second_added=f"q{PDI}"),
+    )
+    body = _sarif(client, audit_id).json()
+
+    result = _find(body, "bidi/orphan-PDI")[0]
+    assert _region(result) == {
+        "startLine": 80, "startColumn": 2, "endLine": 80, "endColumn": 3,
+        "snippet": {"text": "⟨PDI⟩"},
+    }
+
+
+def test_sarif_diff_cross_gap_span_emits_only_audited_lines(client):
+    # Unclosed RLO opens on added line 2; the next audited addition is new-file
+    # line 80. Lines 3..79 are context/untouched and must not be covered, so
+    # the one finding carries two physical locations instead of a region that
+    # spans lines 2..80.
+    diff = (
+        "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n"
+        "@@ -1,1 +1,2 @@\n keep1\n"
+        f"+{RLO}a\n"
+        "@@ -80,1 +80,1 @@\n-gone\n+b\n"
+    )
+    audit_id = _post_diff(client, diff)
+    body = _sarif(client, audit_id).json()
+
+    span = _find(body, "bidi/span-RLO")[0]
+    regions = [
+        {k: v for k, v in loc["physicalLocation"]["region"].items()
+         if k != "snippet"}
+        for loc in span["locations"]
+    ]
+    assert regions == [
+        {"startLine": 2, "startColumn": 1, "endLine": 2, "endColumn": 3},
+        {"startLine": 80, "startColumn": 1, "endLine": 80, "endColumn": 2},
+    ]
+    # The escaped preview is attached to the primary location only.
+    assert span["locations"][0]["physicalLocation"]["region"]["snippet"] == {
+        "text": "⟨RLO⟩a\\nb\\n"
+    }
+    assert "snippet" not in span["locations"][1]["physicalLocation"]["region"]
+    for loc in span["locations"]:
+        assert loc["physicalLocation"]["artifactLocation"]["uri"] == "f.py"
+
+    control = _find(body, "bidi/unclosed-RLO")[0]
+    assert _region(control)["startLine"] == 2
+
+
+def test_sarif_diff_consecutive_added_lines_stay_one_region(client):
+    # Added lines inside one hunk are consecutive in the new file, so the span
+    # keeps a single (multi-line) region with real line numbers.
+    diff = (
+        "--- a\n+++ b\n@@ -1,1 +1,4 @@\n keep\n"
+        f"+{RLO}a\n+b\n+c\n"
+    )
+    audit_id = _post_diff(client, diff)
+    body = _sarif(client, audit_id).json()
+
+    span = _find(body, "bidi/span-RLO")[0]
+    assert len(span["locations"]) == 1
+    assert _region(span) == {
+        "startLine": 2, "startColumn": 1, "endLine": 4, "endColumn": 2,
+        "snippet": {"text": "⟨RLO⟩a\\nb\\nc\\n"},
+    }
+
+
+def test_sarif_diff_multi_hunk_groups_consecutive_and_gapped_runs(client):
+    # Additions at new-file lines 2, 80, 81 (consecutive pair) and 200: the
+    # unclosed span yields regions 2, 80-81 and 200, never 2..200.
+    diff = (
+        "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n"
+        "@@ -1,1 +1,2 @@\n keep\n"
+        f"+{RLO}a\n"
+        "@@ -78,4 +78,4 @@\n c\n d\n-g1\n-g2\n+bb\n+cc\n"
+        "@@ -200,1 +200,1 @@\n-g3\n+z\n"
+    )
+    audit_id = _post_diff(client, diff)
+    body = _sarif(client, audit_id).json()
+
+    span = _find(body, "bidi/span-RLO")[0]
+    line_pairs = [
+        (loc["physicalLocation"]["region"]["startLine"],
+         loc["physicalLocation"]["region"]["endLine"])
+        for loc in span["locations"]
+    ]
+    assert line_pairs == [(2, 2), (80, 81), (200, 200)]
+
+
+def test_sarif_diff_no_newline_last_line_clamps_end_column(client):
+    diff = (
+        "--- a\n+++ b\n@@ -1 +1 @@\n"
+        f"-clean\n+{RLO}y\n"
+        "\\ No newline at end of file\n"
+    )
+    audit_id = _post_diff(client, diff)
+    body = _sarif(client, audit_id).json()
+
+    span = _find(body, "bidi/span-RLO")[0]
+    assert _region(span) == {
+        "startLine": 1, "startColumn": 1, "endLine": 1, "endColumn": 3,
+        "snippet": {"text": "⟨RLO⟩y"},
+    }
+
+
+def test_sarif_diff_fingerprint_matches_plain_record_of_same_text(client):
+    diff = (
+        "diff --git a/f.py b/f.py\n--- a/f.py\n+++ b/f.py\n"
+        "@@ -1,1 +1,2 @@\n keep1\n"
+        f"+{RLO}a\n"
+        "@@ -80,1 +80,1 @@\n-gone\n+b\n"
+    )
+    diff_id = _post_diff(client, diff)
+    diff_record = client.get(f"/api/v1/audits/{diff_id}").json()
+    plain_id = _post(
+        client, diff_record["raw_text"], diff_record["filename"]
+    ).json()["id"]
+
+    diff_fp = _results(_sarif(client, diff_id).json())
+    plain_fp = _results(_sarif(client, plain_id).json())
+    by_rule = lambda rs: {r["ruleId"]: r["partialFingerprints"] for r in rs}
+    assert by_rule(diff_fp) == by_rule(plain_fp)
+    # re-audit under another row id keeps the same fingerprints
+    diff_id_2 = _post_diff(client, diff)
+    assert by_rule(_results(_sarif(client, diff_id_2).json())) == by_rule(diff_fp)
+
+
+def test_sarif_diff_legacy_meta_without_rebuilt_offsets(client):
+    # Records written before rebuilt_start/rebuilt_end were persisted must
+    # still relocate via the added_lines + raw_text reconstruction.
+    diff = _two_hunk_diff(first_added="add1", second_added=f"x{RLO}bad{PDF}")
+    audit_id = _post_diff(client, diff)
+    record = client.get(f"/api/v1/audits/{audit_id}").json()
+    legacy_meta = copy.deepcopy(record["meta"])
+    for entry in legacy_meta["added_lines"]:
+        entry.pop("rebuilt_start", None)
+        entry.pop("rebuilt_end", None)
+
+    from app.sarif import build_sarif
+    doc = build_sarif({**record, "meta": legacy_meta})
+    region = doc["runs"][0]["results"][0]["locations"][0][
+        "physicalLocation"]["region"]
+    assert region["startLine"] == 80
+    assert region["endLine"] == 80
+    assert region["startColumn"] == 2

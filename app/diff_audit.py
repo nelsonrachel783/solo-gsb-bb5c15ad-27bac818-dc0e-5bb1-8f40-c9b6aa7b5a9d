@@ -639,6 +639,27 @@ def _rebuild_added_text(
     return "".join(parts), starts
 
 
+def _rebuilt_ranges(
+    entries: list[AddedLine],
+    starts: list[int],
+    text: str,
+) -> list[tuple[int, int]]:
+    """Half-open rebuilt-text range ``[start, end)`` of every entry.
+
+    The range includes the synthetic ``\\n`` separator appended after
+    newline-terminated entries; the final entry without a trailing newline
+    ends at ``len(text)``.
+    """
+    ranges: list[tuple[int, int]] = []
+    for k, entry in enumerate(entries):
+        start = starts[k]
+        end = start + len(entry.text)
+        if not entry.no_newline and end < len(text) and text[end] == "\n":
+            end += 1
+        ranges.append((start, end))
+    return ranges
+
+
 def _map_offset(
     index: int,
     entries: list[AddedLine],
@@ -743,6 +764,7 @@ def audit_diff(diff_text: str) -> list[FileAudit]:
         if not entries or patch.new_path is None:
             continue
         text, starts = _rebuild_added_text(entries)
+        ranges = _rebuilt_ranges(entries, starts, text)
         result = parse_bidi(text).to_dict()
         locations = _build_locations(
             patch.new_path, entries, starts, text, result
@@ -757,8 +779,15 @@ def audit_diff(diff_text: str) -> list[FileAudit]:
                     "new_line": e.new_line,
                     "diff_line": e.diff_line,
                     "no_newline": e.no_newline,
+                    # Rebuilt-text (raw_text) extent of this entry, including
+                    # the synthetic "\n" separator when present.  The SARIF
+                    # exporter uses it to translate parser offsets back to
+                    # real new-file line numbers, so it must never be derived
+                    # by assuming rebuilt lines are contiguous in the file.
+                    "rebuilt_start": starts[k],
+                    "rebuilt_end": ranges[k][1],
                 }
-                for e in entries
+                for k, e in enumerate(entries)
             ],
             "locations": locations,
         }

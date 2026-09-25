@@ -263,6 +263,9 @@ curl -s -X POST http://localhost:8000/api/v1/audits/diff \
 - `result` 是对**重建后新增文本**（无新增行之间的空行拼接问题：按新文件顺序逐行
   连接，行末按 No-newline 标记决定是否补 `\n`）的原始解析结果，结构与
   `POST /api/v1/audits` 完全一致，因此该记录同样支持 `verify` 与 `sarif`。
+  `meta.added_lines[]` 额外保存每条新增行在重建文本中的半开区间
+  `rebuilt_start`/`rebuilt_end`（含行末合成的 `\n`），SARIF 导出据此把命中
+  定位到**新文件真实行号**而不是拼接文本行号（详见下文 SARIF 一节）。
 - 纯删除文件、二进制补丁（`Binary files … differ` / `GIT binary patch` Base85 段）、
   空文件与无新增行的文件不产生记录（仍计入合法 diff）；所有文件都无新增内容时
   返回 201、`file_count: 0`、`risk_level: "info"`。
@@ -920,9 +923,11 @@ curl -s http://localhost:8000/api/v1/audits/1/verify | jq
 - 为每个**危险区段**（RLO/LRO 覆盖范围、未闭合区段）生成一条 result，定位到整个 `[start, end)` 区段；
 - 每条 result 的 `level` 由其 `risk` 映射：`critical/high → error`、`medium → warning`、`low/info → note`（规则 `defaultConfiguration.level` 与 `properties.security-severity` 同步设置）；
 - `region` 的行列均为 1 起始，**列按 UTF-16 码元逐行计算**（SARIF 规范要求），使用存储的原文重算，含 astral 字符（如 emoji，占 2 个 UTF-16 码元）时列号正确偏移；跨多行的区段同时给出 `startLine/endLine`；
-- location 的 `artifactLocation.uri` 取记录中的 `filename`；缺失文件名时回退为 `audit-{id}`；
-- 每条 result 带稳定 `partialFingerprints`：对「规则 id | 码点 | 起止码点范围」取 SHA-256，**不含数据库行 id**，因此同一内容重复审计产生相同指纹，便于平台做去重/回归匹配；
-- `rules` 去重并按 id 排序，`results` 按（起始行、起始列、规则 id）排序，输出完全确定。
+- **`POST /api/v1/audits/diff` 产生的记录按新文件真实行号定位**：该类记录的 `raw_text` 只是把各 hunk 的新增行按新文件顺序拼接，行号与新文件并不连续。导出时依据记录 `meta.added_lines` 中每条新增行的新文件行号及其在 `raw_text` 中的区间（`rebuilt_start`/`rebuilt_end`）把逻辑偏移换算回真实行号——例如新文件第 80 行上的控制符即使在拼接文本中排第 2 行，SARIF 仍定位到第 80 行；列同样按该行的 UTF-16 码元计算；
+- **危险区段跨越不连续的新增行时（中间隔着未审计的上下文/删除/未触及行），只覆盖实际审计的新增行**：同一条 result 会携带多个 `physicalLocation`，每个对应一段行号连续的新增行，绝不会把中间未审计行包进单个区域；行号连续的相邻新增行仍合并为一个跨行区域，`snippet` 只放在首个（主）location 上；
+- location 的 `artifactLocation.uri` 取记录中的 `filename`（diff 记录即新文件路径）；缺失文件名时回退为 `audit-{id}`；
+- 每条 result 带稳定 `partialFingerprints`：对「规则 id | 码点 | 起止码点范围」取 SHA-256，**不含数据库行 id、也不依赖定位方式**——同一段重建文本无论作为普通文本记录还是 diff 记录导出（即使 diff 行号被重映射、区域被拆成多个 location），指纹都一致，因此同一内容重复审计产生相同指纹，便于平台做去重/回归匹配；
+- `rules` 去重并按 id 排序，`results` 按首个 location 的（起始行、起始列、规则 id）排序，输出完全确定。
 
 ```bash
 curl -s http://localhost:8000/api/v1/audits/1/sarif -o bidi-audit.sarif
@@ -961,6 +966,38 @@ curl -s http://localhost:8000/api/v1/audits/1/sarif -o bidi-audit.sarif
     }]
   }]
 }
+```
+
+unified-diff 记录的导出示例：RLO 出现在第二个 hunk 的新文件第 80 行
+（`raw_text` 里它只是拼接文本的第 2 行），导出仍定位到第 80 行：
+
+```json
+"results": [{
+  "ruleId": "bidi/span-RLO",
+  "level": "error",
+  "locations": [{"physicalLocation": {
+    "artifactLocation": {"uri": "f.py"},
+    "region": {"startLine": 80, "startColumn": 2,
+               "endLine": 80, "endColumn": 6,
+               "snippet": {"text": "⟨RLO⟩bad"}}}}],
+  "partialFingerprints": {"bidi-audit/v1/sha256": "…"}
+}]
+```
+
+若危险区段从第 2 行的新增内容一直延伸（控制符未闭合），而下一条新增行在
+第 80 行（中间 3..79 行未被审计），同一条 result 会带**两个**
+`physicalLocation`，各自只覆盖实际审计过的新增行：
+
+```json
+"locations": [
+  {"physicalLocation": {"artifactLocation": {"uri": "f.py"},
+   "region": {"startLine": 2, "startColumn": 1,
+              "endLine": 2, "endColumn": 3,
+              "snippet": {"text": "⟨RLO⟩a\\nb\\n"}}}},
+  {"physicalLocation": {"artifactLocation": {"uri": "f.py"},
+   "region": {"startLine": 80, "startColumn": 1,
+              "endLine": 80, "endColumn": 2}}}
+]
 ```
 
 规则 id 一览：
@@ -1246,7 +1283,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
 │   ├── verify.py      # 重算校验：从原文重新解析并与存储结果逐字段 diff
-│   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、指纹）
+│   ├── sarif.py       # 已存审计 -> SARIF 2.1.0（rule/result、UTF-16 列、diff 记录按新文件行号重定位、指纹）
 │   ├── database.py    # SQLite schema / CRUD / 查询（含可选 meta_json）
 │   ├── schemas.py     # Pydantic 请求模型
 │   ├── main.py        # FastAPI 路由
@@ -1291,6 +1328,12 @@ SARIF 信封与工具元数据、清洁/仅标记零发现、文件名与 `audit
 risk→level 映射（error/warning）、未闭合/平衡/孤立/隐式终止各类 rule/result、
 astral 字符与跨行区段的 UTF-16 列、规则去重排序、结果确定性排序、
 partialFingerprints 的稳定性与随范围/规则变化、重复审计同指纹、以及 404；
+并覆盖 unified-diff 记录按 `meta.added_lines` 重定位到新文件真实行号
+（多 hunk 间第 80 行场景、UTF-16 列、孤立闭合符与隐式终止）、危险区段跨越
+不连续新增行时拆成多个只覆盖实际审计行的 location（行号连续的新增行仍合并
+为一个跨行区域、snippet 只在主 location）、No-newline 末行列钳制、diff 与
+普通文本记录对同一发现的指纹一致、旧版无 `rebuilt_start/end` 的 meta 仍可
+重定位；
 unified diff 审计覆盖多文件/多 hunk 解析、仅分析新增行（删除行与上下文行被忽略）、
 按新文件行号推进与列映射、diff 行/列映射与逻辑索引保留、未闭合/孤立/隐式终止错误
 与跨行危险区段回映射、每文件一条记录与汇总最高风险、No-newline 标记（行末/行中）、
